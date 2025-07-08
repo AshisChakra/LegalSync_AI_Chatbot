@@ -1,8 +1,12 @@
 import os
 import uuid
+import ast
+import json
 import pandas as pd
 from PyPDF2 import PdfReader
+from pathlib import Path
 from dotenv import load_dotenv
+from pydantic import BaseModel
 from langchain_core.documents import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -12,12 +16,9 @@ from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from langchain.agents import initialize_agent, Tool
 from langchain.agents.agent_types import AgentType
 from langchain.tools import tool
-from pathlib import Path
-from pydantic import BaseModel
-import json
-import ast
+from models import QueryRequest
 
-# Load environment
+# Load environment variables
 load_dotenv()
 
 # Constants
@@ -26,7 +27,7 @@ CSV_PATH = "../assets/sample.csv"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
-# Embeddings + Chat Model
+# Embedding and Chat Model
 embeddings = AzureOpenAIEmbeddings(
     api_key=os.getenv("AZURE_API_KEY"),
     azure_endpoint=os.getenv("AZURE_ENDPOINT"),
@@ -43,8 +44,10 @@ chat_model = AzureChatOpenAI(
     model=os.getenv("CHAT_MODEL_NAME")
 )
 
-# Output Schema
+# Output schemas
 class LegalResponse(BaseModel):
+    reqid: str
+    query: str
     title: str
     page_number: list[int]
     court_level: str
@@ -52,12 +55,17 @@ class LegalResponse(BaseModel):
     domain: str
     response_text: str
 
-# CSV Extraction (if not present)
+class ErrorResponse(BaseModel):
+    reqid: str
+    query: str
+    error: str
+
+# PDF to CSV embedding
 def extract_pdf_to_csv():
     if os.path.exists(CSV_PATH) and os.stat(CSV_PATH).st_size > 0:
         return
     reader = PdfReader(str(PDF_PATH))
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
         import csv
         writer = csv.DictWriter(f, fieldnames=["file_name", "page_number", "year", "chunk_vector", "chunk_id"])
@@ -66,7 +74,7 @@ def extract_pdf_to_csv():
             text = page.extract_text()
             if not text:
                 continue
-            chunks = text_splitter.split_text(text)
+            chunks = splitter.split_text(text)
             vectors = embeddings.embed_documents(chunks)
             for chunk, vector in zip(chunks, vectors):
                 writer.writerow({
@@ -77,10 +85,10 @@ def extract_pdf_to_csv():
                     "chunk_id": str(uuid.uuid4())
                 })
 
-# Tool: FAISS-based semantic vector search
+# Tool: semantic vector lookup
 @tool
 def query_csv_chunks(query: str) -> str:
-    """Semantic search over legal case chunks stored in CSV."""
+    """Semantic search over legal case chunks stored in the CSV."""
     df = pd.read_csv(CSV_PATH)
     docs = []
     for _, row in df.iterrows():
@@ -93,7 +101,6 @@ def query_csv_chunks(query: str) -> str:
             docs.append(doc)
         except Exception:
             continue
-
     if not docs:
         return json.dumps([])
 
@@ -104,13 +111,14 @@ def query_csv_chunks(query: str) -> str:
             "file_name": r.page_content.split(" page ")[0],
             "page_number": int(r.page_content.split(" page ")[1]),
             "chunk_id": r.metadata["chunk_id"]
-        }
-        for r in results
+        } for r in results
     ])
 
-# Main Chain
-def retrieve_and_generate(inputs: dict) -> dict:
-    topic = inputs["topic"]
+# Main logic
+def retrieve_and_generate(payload: QueryRequest) -> BaseModel:
+    reqid = payload.reqid
+    query = payload.query
+
     extract_pdf_to_csv()
 
     agent = initialize_agent(
@@ -120,53 +128,74 @@ def retrieve_and_generate(inputs: dict) -> dict:
         verbose=False
     )
 
-    query_instruction = (
+    instruction = (
         f"You are a legal case assistant. Use the tool 'QueryCSV' only. "
         f"Do not answer directly. Your task is to extract relevant legal chunk metadata "
-        f"by running QueryCSV with the input: '{topic}'. Return the result as a JSON array. "
+        f"by running QueryCSV with the input: '{query}'. Return the result as a JSON array. "
         f"If no match is found, return '[]'."
     )
 
-    agent_response = agent.run(query_instruction)
-    print("🧠 Agent raw output:", agent_response)
-
     try:
+        agent_response = agent.run(instruction)
+        print("🧠 Agent Output:", agent_response)
         chunks_info = json.loads(agent_response)
         if not chunks_info:
-            return {"error": "No relevant legal case chunks found. Please refine your query."}
-    except json.JSONDecodeError:
-        return {"error": "No structured case data found. Please try a more specific legal term or query."}
+            return ErrorResponse(
+                reqid=reqid,
+                query=query,
+                error="⚠️ No relevant legal case chunks found. Please refine your query."
+            )
+    except Exception as e:
+        return ErrorResponse(
+            reqid=reqid,
+            query=query,
+            error=f"Agent chunk extraction failed: {str(e)}"
+        )
 
     try:
         reader = PdfReader(str(PDF_PATH))
         context = ""
-        page_numbers = []
+        pages = []
         for item in chunks_info:
-            page_number = int(item["page_number"])
-            page_numbers.append(page_number)
-            context += reader.pages[page_number - 1].extract_text()[:1000] + "\n---\n"
+            pg = int(item["page_number"])
+            pages.append(pg)
+            raw_text = reader.pages[pg - 1].extract_text()
+            if raw_text:
+                context += raw_text.strip()[:1000] + "\n---\n"
 
-        # Prompt for JSON response with structure
-        response_prompt = ChatPromptTemplate.from_template(
-            """
-            You are a legal analyst. Based on the context below, return a response in valid JSON format with these fields:
-            - title: full case title
-            - page_number: list of pages this summary is derived from
-            - court_level: High Court or Supreme Court
-            - location: if mentioned, where the case was heard
-            - domain: one of ['criminal', 'civil', 'family', 'constitutional', 'labor', 'tax', 'property']
-            - response_text: respond appropriately based on the user input. Use the context to answer the user query.
+        response_prompt = ChatPromptTemplate.from_template("""
+        You are a legal assistant. Based on the context below, return a valid JSON response with:
+        - title: full legal case title
+        - page_number: list of page numbers from where info was extracted
+        - court_level: Supreme Court or High Court
+        - location: where the case was heard (if available)
+        - domain: criminal, civil, family, constitutional, labor, tax, property
+        - response_text: respond appropriately to the user’s query.
 
-            Context:
-            {context}
+        Context:
+        {context}
 
-            Topic: {topic}
-            """
+        User Query:
+        {topic}
+        """)
+
+        raw_response = (response_prompt | chat_model | StrOutputParser()).invoke({
+            "context": context,
+            "topic": query
+        })
+
+        cleaned = raw_response.strip().removeprefix("```json").removesuffix("```").strip()
+        parsed = LegalResponse.model_validate_json(cleaned)
+        parsed.reqid = reqid
+        parsed.query = query
+        return parsed
+    except Exception as e:
+        return ErrorResponse(
+            reqid=reqid,
+            query=query,
+            error=f"❌ Failed to generate response: {str(e)}"
         )
 
-        response_text = (response_prompt | chat_model | StrOutputParser()).invoke({"context": context, "topic": topic})
-
-        cleaned_json = response_text.strip().removeprefix("```json").removesuffix("```").strip()
-        return LegalResponse.model_validate_json(cleaned_json).dict()
-    except Exception as e:
-        return {"error": f"Failed to extract legal response: {str(e)}"}
+# ✅ Kafka-compatible entry point
+def process_query(payload: QueryRequest) -> BaseModel:
+    return retrieve_and_generate(payload)

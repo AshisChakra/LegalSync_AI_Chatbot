@@ -1,62 +1,37 @@
-# import requests
-# import streamlit as st
-
-# def get_chat_response(topic):
-#     url = "http://localhost:8000/legal-analysis/invoke" 
-#     headers = {"Content-Type": "application/json"}
-#     data = {"input": {"topic": topic}} 
-    
-#     response = requests.post(url, json=data, headers=headers)
-    
-#     if response.status_code == 200:
-#         return response.json().get("output", "No output received.")
-#     else:
-#         return f"Error: {response.status_code} - {response.text}"
-
-# # Streamlit app
-# st.title("Chatbot Client")
-# st.set_page_config(page_title="Chatbot Client", layout="wide")
-
-# input_text = st.text_input("Enter a topic for the legal:")
-
-# if input_text:
-#     with st.spinner("Generating legal..."):
-#         output = get_chat_response(input_text)
-#         st.write("Generated legal:")
-#         st.write(output)
-
-
-
-
-
 import streamlit as st
 import requests
-from kafka_producer import send_query_to_kafka
+import uuid
+from datetime import datetime
 
-def fetch_latest_response():
-    try:
-        res = requests.get("http://localhost:8000/last-response")
-        if res.status_code == 200:
-            return res.json()
-    except:
-        return None
+# 🔧 Function to generate payload with dynamic user_id, session_id, reqid
+def generate_request_payload(user_input: str):
+    user_id = f"u_{str(uuid.uuid4())[:8]}"
+    session_id = f"s_{str(uuid.uuid4())[:8]}"
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    reqid = f"{user_id}_{session_id}_{timestamp}"
 
-st.set_page_config(page_title="Legal Chatbot Client", layout="wide")
-st.title("Legal Chatbot Client (Kafka-enabled)")
+    return {
+        "user_id": user_id,
+        "session_id": session_id,
+        "reqid": reqid,
+        "query": user_input
+    }
 
+# 🌐 API endpoint (FastAPI-based Kafka producer)
+API_URL = "http://localhost:8000/legal-analysis/send"
+
+# 🖼️ Streamlit UI
+st.set_page_config(page_title="Legal Chatbot (Kafka-enabled)", layout="wide")
+st.title("⚖️ Legal Chatbot Client (Kafka-enabled)")
 user_input = st.text_input("🔍 Ask a legal question:")
 
-if st.button("🚀 Send to Kafka"):
-    send_query_to_kafka(user_input)
-    st.success(f"✅ Query sent to Kafka: {user_input}")
-
-    with st.spinner("⏳ Waiting for response from consumer..."):
-        import time
-        for _ in range(20):
-            time.sleep(1)
-            result = fetch_latest_response()
-            if result:
-                st.json(result)
-                break
+if st.button("🚀 Send to Kafka") and user_input:
+    payload = generate_request_payload(user_input)
+    try:
+        response = requests.post(API_URL, json=payload, timeout=10)
+        if response.status_code == 200:
+            st.success(f"✅ Query sent to Kafka: {payload['query']}")
         else:
-            st.warning("⚠️ Timed out waiting for response.")
+            st.error(f"❌ Error from server: {response.status_code} - {response.text}")
+    except Exception as e:
+        st.error(f"🚨 Request failed: {str(e)}")
