@@ -1,7 +1,7 @@
 import json
 from kafka import KafkaConsumer
 from pydantic import ValidationError
-from models import QueryResponse, ErrorResponse
+from models import LegalResponse, ErrorResponse
 
 consumer = KafkaConsumer(
     'legal-response-topic',
@@ -21,7 +21,7 @@ for message in consumer:
             err = ErrorResponse(**data)
             print(f"⚠️ Error for {err.reqid}: {err.error}")
         else:
-            res = QueryResponse(**data)
+            res = LegalResponse(**data)
             print(f"\n✅ Response for {res.reqid}:")
             print(f"🧠 Query: {res.query}")
             print(f"📄 Title: {res.title}")
