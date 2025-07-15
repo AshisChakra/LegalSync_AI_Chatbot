@@ -1,4 +1,5 @@
 import os
+from typing import Union
 import uuid
 import ast
 import json
@@ -115,7 +116,7 @@ def query_csv_chunks(query: str) -> str:
     ])
 
 # Main logic
-def retrieve_and_generate(payload: QueryRequest) -> BaseModel:
+def retrieve_and_generate(payload: QueryRequest) -> Union[LegalResponse, ErrorResponse]:
     reqid = payload.reqid
     query = payload.query
 
@@ -185,10 +186,15 @@ def retrieve_and_generate(payload: QueryRequest) -> BaseModel:
         })
 
         cleaned = raw_response.strip().removeprefix("```json").removesuffix("```").strip()
-        parsed = LegalResponse.model_validate_json(cleaned)
-        parsed.reqid = reqid
-        parsed.query = query
-        return parsed
+
+        # ✅ Parse as dict and inject required fields
+        parsed = json.loads(cleaned)
+        parsed["reqid"] = reqid
+        parsed["query"] = query
+
+        # ✅ Validate complete data using Pydantic
+        return LegalResponse(**parsed)
+
     except Exception as e:
         return ErrorResponse(
             reqid=reqid,
@@ -196,6 +202,9 @@ def retrieve_and_generate(payload: QueryRequest) -> BaseModel:
             error=f"❌ Failed to generate response: {str(e)}"
         )
 
+
 # ✅ Kafka-compatible entry point
-def process_query(payload: QueryRequest) -> BaseModel:
-    return retrieve_and_generate(payload)
+def process_query(payload: QueryRequest) -> dict:
+    result = retrieve_and_generate(payload)
+    return result.model_dump() if isinstance(result, BaseModel) else result
+

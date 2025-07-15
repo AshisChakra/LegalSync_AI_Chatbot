@@ -1,94 +1,82 @@
-# import json
-# from confluent_kafka import Consumer, Producer
-# from models import QueryRequest
-# from rag_service import process_query
-
-# consumer = Consumer({
-#     'bootstrap.servers': 'localhost:9092',
-#     'group.id': 'legal-query-consumer',
-#     'auto.offset.reset': 'earliest'
-# })
-# producer = Producer({'bootstrap.servers': 'localhost:9092'})
-# consumer.subscribe(["legal-query-topic"])
-
-# print("🟢 Kafka Query Consumer Running...")
-
-# while True:
-#     msg = consumer.poll(1.0)
-#     if msg is None:
-#         continue
-#     if msg.error():
-#         print(f"⚠️ Consumer error: {msg.error()}")
-#         continue
-
-#     try:
-#         payload = json.loads(msg.value())
-#         query = QueryRequest(**payload)
-#         response = process_query(query)
-#         producer.produce("legal-response-topic", value=response.model_dump_json())
-#         producer.flush()
-#         print(f"✅ Processed and sent response for reqid: {query.reqid}")
-#     except Exception as e:
-#         print(f"❌ Failed to process message: {e}")
-
-from kafka import KafkaConsumer, KafkaProducer
-from models import QueryRequest
-from rag_service import process_query
 import json
 import threading
 import time
+from typing import List, Union
+from kafka import KafkaConsumer, KafkaProducer
+from models import QueryRequest
+from rag_service import process_query, LegalResponse, ErrorResponse
 
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
 REQUEST_TOPIC = "legal-query-topic"
 RESPONSE_TOPIC = "legal-response-topic"
+BOOTSTRAP_SERVERS = "localhost:9092"
 BATCH_SIZE = 5
 BATCH_TIMEOUT = 3  # seconds
 
+print("🟢 Kafka Query Consumer Running...")
+
 consumer = KafkaConsumer(
     REQUEST_TOPIC,
-    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-    auto_offset_reset='earliest',
+    bootstrap_servers=BOOTSTRAP_SERVERS,
+    group_id="rag-query-consumer",
+    value_deserializer=lambda x: json.loads(x.decode("utf-8")),
+    auto_offset_reset="earliest",
     enable_auto_commit=True,
-    group_id='legal-batch-group',
-    value_deserializer=lambda x: json.loads(x.decode('utf-8'))
 )
 
 producer = KafkaProducer(
-    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-    value_serializer=lambda x: json.dumps(x).encode('utf-8')
+    bootstrap_servers=BOOTSTRAP_SERVERS,
+    value_serializer=lambda x: json.dumps(x).encode("utf-8")
 )
 
-print("🟢 Kafka Query Consumer Running...")
+lock = threading.Lock()
+message_batch: List[dict] = []
 
-def handle_batch(batch):
+def process_batch(batch: List[dict]):
     threads = []
 
-    def worker(payload):
+    def handle(req_data: dict):
         try:
-            req = QueryRequest(**payload)
-            response = process_query(req)
-            producer.send(RESPONSE_TOPIC, value=response.model_dump())
+            req = QueryRequest(**req_data)
+            response_obj: Union[LegalResponse, ErrorResponse, dict] = process_query(req)
+
+            # Ensure we get a dict
+            if isinstance(response_obj, (LegalResponse, ErrorResponse)):
+                response_dict = response_obj.model_dump()
+            else:
+                response_dict = response_obj  # Already a dict
+
+            # Ensure required fields are present
+            response_dict.setdefault("reqid", req.reqid)
+            response_dict.setdefault("query", req.query)
+
+            producer.send(RESPONSE_TOPIC, value=response_dict)
+
         except Exception as e:
-            print(f"❌ Error processing request {payload.get('reqid')}: {e}")
+            print(f"❌ Error processing request {req_data.get('reqid')}: {e}")
 
     for item in batch:
-        t = threading.Thread(target=worker, args=(item,))
-        t.start()
-        threads.append(t)
+        thread = threading.Thread(target=handle, args=(item,))
+        threads.append(thread)
+        thread.start()
 
     for t in threads:
         t.join()
 
-def consume_in_batches():
-    batch = []
+def batch_consumer():
+    global message_batch
     last_batch_time = time.time()
 
-    for message in consumer:
-        batch.append(message.value)
-        if len(batch) >= BATCH_SIZE or (time.time() - last_batch_time >= BATCH_TIMEOUT):
-            handle_batch(batch)
-            batch = []
-            last_batch_time = time.time()
+    for msg in consumer:
+        with lock:
+            message_batch.append(msg.value)
+
+        now = time.time()
+        with lock:
+            if len(message_batch) >= BATCH_SIZE or (now - last_batch_time) >= BATCH_TIMEOUT:
+                batch_to_process = message_batch.copy()
+                message_batch.clear()
+                last_batch_time = now
+                threading.Thread(target=process_batch, args=(batch_to_process,)).start()
 
 if __name__ == "__main__":
-    consume_in_batches()
+    batch_consumer()
