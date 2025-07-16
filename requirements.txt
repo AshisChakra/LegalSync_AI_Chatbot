@@ -181,3 +181,5 @@ yarl==1.20.1
 yfinance==0.2.52
 zstandard==0.23.0
 pymupdf
+scikit-learn
+pdfplumber
