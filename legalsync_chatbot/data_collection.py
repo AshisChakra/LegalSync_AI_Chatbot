@@ -59,8 +59,8 @@ def download_pdf(url, output_path):
         with open(output_path, 'wb') as f:
             f.write(response.content)
         print(f"Downloaded {url} to {output_path}")
-        json_str, counts = process_pdf_llm(output_path)
-        # json_str = process_pdf(output_path)
+        # json_str, counts = process_pdf_llm(output_path)
+        json_str = process_pdf(output_path)
         move_pdf_basedOn_json_string(json_str, output_path, "classified_pdf")
     except requests.exceptions.RequestException as e:
         print(f"Failed to download {url}: {e}")
