@@ -1,15 +1,13 @@
 import os
 from typing import Union
-import uuid
 import ast
 import json
 import pandas as pd
-from PyPDF2 import PdfReader
-from pathlib import Path
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 from pydantic import BaseModel
 from langchain_core.documents import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -23,10 +21,7 @@ from models import QueryRequest
 load_dotenv()
 
 # Constants
-PDF_PATH = "../assets/sample.pdf"
-CSV_PATH = "../assets/sample.csv"
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+CSV_PATH = "./pdf_chunks.csv"
 
 # Embedding and Chat Model
 embeddings = AzureOpenAIEmbeddings(
@@ -61,78 +56,88 @@ class ErrorResponse(BaseModel):
     query: str
     error: str
 
-# PDF to CSV embedding
-def extract_pdf_to_csv():
-    if os.path.exists(CSV_PATH) and os.stat(CSV_PATH).st_size > 0:
-        return
-    reader = PdfReader(str(PDF_PATH))
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-        import csv
-        writer = csv.DictWriter(f, fieldnames=["file_name", "page_number", "year", "chunk_vector", "chunk_id"])
-        writer.writeheader()
-        for i, page in enumerate(reader.pages):
-            text = page.extract_text()
-            if not text:
-                continue
-            chunks = splitter.split_text(text)
-            vectors = embeddings.embed_documents(chunks)
-            for chunk, vector in zip(chunks, vectors):
-                writer.writerow({
-                    "file_name": os.path.basename(PDF_PATH),
-                    "page_number": i + 1,
-                    "year": "2009",
-                    "chunk_vector": json.dumps(vector),
-                    "chunk_id": str(uuid.uuid4())
-                })
-
-# Tool: semantic vector lookup
+# Tool: MongoDB first, fallback to CSV
 @tool
-def query_csv_chunks(query: str) -> str:
-    """Semantic search over legal case chunks stored in the CSV."""
-    df = pd.read_csv(CSV_PATH)
+def query_case_chunks(query: str) -> str:
+    """
+    Semantic search over legal case chunks.
+    Priority: MongoDB -> CSV fallback.
+    """
     docs = []
-    for _, row in df.iterrows():
-        try:
-            vector = ast.literal_eval(row["chunk_vector"])
-            doc = Document(
-                page_content=f"{row['file_name']} page {row['page_number']}",
-                metadata={"embedding": vector, "chunk_id": row["chunk_id"]}
-            )
-            docs.append(doc)
-        except Exception:
-            continue
+
+    try:
+        mongo_client = MongoClient(os.getenv("MONGO_URI"), serverSelectionTimeoutMS=2000)
+        mongo_client.admin.command("ping")
+
+        db = mongo_client[os.getenv("MONGO_DB_NAME", "legal_db")]
+        collection = db[os.getenv("MONGO_COLLECTION_NAME", "pdf_chunks")]
+
+        print("✅ Connected to MongoDB")
+
+        for row in collection.find():
+            try:
+                vector = row.get("chunk_vector")
+                if isinstance(vector, str):
+                    vector = ast.literal_eval(vector)
+
+                doc = Document(
+                    page_content=f"{row['file_name']} page {row['page_number']}",
+                    metadata={"embedding": vector, "chunk_id": row["chunk_id"]}
+                )
+                docs.append(doc)
+            except Exception:
+                continue
+
+    except ConnectionFailure:
+        print("⚠️ MongoDB unavailable — falling back to CSV.")
+        if not os.path.exists(CSV_PATH):
+            return json.dumps([])
+
+        df = pd.read_csv(CSV_PATH)
+        for _, row in df.iterrows():
+            try:
+                vector = ast.literal_eval(row["chunk_vector"])
+                doc = Document(
+                    page_content=f"{row['file_name']} page {row['page_number']}",
+                    metadata={"embedding": vector, "chunk_id": row["chunk_id"]}
+                )
+                docs.append(doc)
+            except Exception:
+                continue
+
+    # Build vector store and search
     if not docs:
         return json.dumps([])
 
-    vector_store = FAISS.from_documents(docs, embeddings)
-    results = vector_store.similarity_search(query, k=3)
-    return json.dumps([
-        {
-            "file_name": r.page_content.split(" page ")[0],
-            "page_number": int(r.page_content.split(" page ")[1]),
-            "chunk_id": r.metadata["chunk_id"]
-        } for r in results
-    ])
+    try:
+        vector_store = FAISS.from_documents(docs, embeddings)
+        results = vector_store.similarity_search(query, k=3)
+        return json.dumps([
+            {
+                "file_name": r.page_content.split(" page ")[0],
+                "page_number": int(r.page_content.split(" page ")[1]),
+                "chunk_id": r.metadata["chunk_id"]
+            } for r in results
+        ])
+    except Exception:
+        return json.dumps([])
 
-# Main logic
+# Core RAG logic
 def retrieve_and_generate(payload: QueryRequest) -> Union[LegalResponse, ErrorResponse]:
     reqid = payload.reqid
     query = payload.query
 
-    extract_pdf_to_csv()
-
     agent = initialize_agent(
-        tools=[Tool.from_function(query_csv_chunks, name="QueryCSV", description="Query legal chunks by topic")],
+        tools=[Tool.from_function(query_case_chunks, name="QueryChunks", description="Query legal chunks by topic")],
         llm=chat_model,
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=False
     )
 
     instruction = (
-        f"You are a legal case assistant. Use the tool 'QueryCSV' only. "
+        f"You are a legal case assistant. Use the tool 'QueryChunks' only. "
         f"Do not answer directly. Your task is to extract relevant legal chunk metadata "
-        f"by running QueryCSV with the input: '{query}'. Return the result as a JSON array. "
+        f"by running QueryChunks with the input: '{query}'. Return the result as a JSON array. "
         f"If no match is found, return '[]'."
     )
 
@@ -154,15 +159,11 @@ def retrieve_and_generate(payload: QueryRequest) -> Union[LegalResponse, ErrorRe
         )
 
     try:
-        reader = PdfReader(str(PDF_PATH))
-        context = ""
-        pages = []
-        for item in chunks_info:
-            pg = int(item["page_number"])
-            pages.append(pg)
-            raw_text = reader.pages[pg - 1].extract_text()
-            if raw_text:
-                context += raw_text.strip()[:1000] + "\n---\n"
+        # Use chunk metadata as context since full text is not present
+        context = "\n".join([
+            f"File: {item['file_name']}, Page: {item['page_number']}, Chunk ID: {item['chunk_id']}"
+            for item in chunks_info
+        ])
 
         response_prompt = ChatPromptTemplate.from_template("""
         You are a legal assistant. Based on the context below, return a valid JSON response with:
@@ -186,13 +187,10 @@ def retrieve_and_generate(payload: QueryRequest) -> Union[LegalResponse, ErrorRe
         })
 
         cleaned = raw_response.strip().removeprefix("```json").removesuffix("```").strip()
-
-        # ✅ Parse as dict and inject required fields
         parsed = json.loads(cleaned)
         parsed["reqid"] = reqid
         parsed["query"] = query
 
-        # ✅ Validate complete data using Pydantic
         return LegalResponse(**parsed)
 
     except Exception as e:
@@ -202,9 +200,7 @@ def retrieve_and_generate(payload: QueryRequest) -> Union[LegalResponse, ErrorRe
             error=f"❌ Failed to generate response: {str(e)}"
         )
 
-
-# ✅ Kafka-compatible entry point
+# Kafka-compatible entry point
 def process_query(payload: QueryRequest) -> dict:
     result = retrieve_and_generate(payload)
     return result.model_dump() if isinstance(result, BaseModel) else result
-
