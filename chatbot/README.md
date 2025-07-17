@@ -23,7 +23,7 @@ It supports dynamic user sessions and concurrent processing using Kafka consumer
 |--------------|----------------------------------|
 | Frontend     | Streamlit                        |
 | Backend      | FastAPI (optional)               |
-| LLM          | Azure OpenAI GPT (`gpt-35-turbo`) |
+| LLM          | Azure OpenAI GPT (`gpt-4o mini`) |
 | Embeddings   | `text-embedding-ada-002`         |
 | RAG Engine   | LangChain + FAISS                |
 | Messaging    | Apache Kafka + Zookeeper (Docker)|
@@ -161,11 +161,13 @@ python chatbot/kafka_response_consumer.py
 streamlit run chatbot/client.py
 ```
 
-(Optional):
-
 ```
-# Terminal 4: Start FastAPI (if needed)
+# Terminal 4: Start FastAPI
 python chatbot/api.py
+
+
+# Terminal 5: Start Docker
+docker-compose up -d
 ```
 
 ---
